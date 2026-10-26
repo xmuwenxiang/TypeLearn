@@ -23,6 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         SettingsStore.syncLaunchAtLogin()
         menuBarController = MenuBarController()
+        // 快捷键兜底：AX 读不到文本的应用（Sublime Text、终端等）用 ⌃⌘T 选中翻译
+        ClipboardTranslationTrigger.shared.start()
+        InputMonitor.shared.onTextUnreadable = { [weak self] appName in
+            self?.menuBarController?.showFallbackHint(appName: appName)
+        }
         if AXIsProcessTrusted() {
             InputMonitor.shared.start()
         } else {

@@ -7,6 +7,8 @@ final class MenuBarController: NSObject {
     private var isPaused = false
     private var settingsWindow: NSWindow?
     private var historyWindow: NSWindow?
+    /// AX 读不到文本的应用名，非空时在菜单顶部提示改用快捷键
+    private var fallbackHintApp: String?
 
     override init() {
         super.init()
@@ -17,11 +19,26 @@ final class MenuBarController: NSObject {
 
     private func rebuildMenu() {
         let menu = NSMenu()
+        // 当前应用不支持实时监听时，置顶提示可用快捷键兜底
+        if let fallbackHintApp {
+            let hint = NSMenuItem(title: "\(fallbackHintApp) 不支持实时监听，选中文本后按 ⌃⌘T",
+                                  action: nil,
+                                  keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
+            menu.addItem(.separator())
+        }
         let toggle = NSMenuItem(title: isPaused ? "恢复学习" : "暂停学习",
                                 action: #selector(togglePause),
                                 keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
+
+        let translateSelection = NSMenuItem(title: "翻译选中文本（⌃⌘T）",
+                                            action: #selector(translateSelection),
+                                            keyEquivalent: "")
+        translateSelection.target = self
+        menu.addItem(translateSelection)
 
         let history = NSMenuItem(title: "翻译历史…", action: #selector(openHistory), keyEquivalent: "h")
         history.target = self
@@ -42,6 +59,17 @@ final class MenuBarController: NSObject {
     @objc private func togglePause() {
         isPaused.toggle()
         InputMonitor.shared.setPaused(isPaused)
+        rebuildMenu()
+    }
+
+    @objc private func translateSelection() {
+        ClipboardTranslationTrigger.shared.fire()
+    }
+
+    /// 由 InputMonitor 回调：某应用 AX 读不到文本时提示快捷键兜底
+    func showFallbackHint(appName: String) {
+        guard fallbackHintApp != appName else { return }
+        fallbackHintApp = appName
         rebuildMenu()
     }
 

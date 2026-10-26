@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 
 /// 通过 AX API 监听焦点输入框文本变化；CGEventTap 辅助检测回车/Esc
 final class InputMonitor {
@@ -16,6 +17,14 @@ final class InputMonitor {
     /// 强制开启辅助功能后，首次读到 value 时只建基线不当作新增输入（避免已有文本误触发翻译）
     private var awaitingFirstValue = false
     private(set) var isPaused = false
+    /// 用户在按键却始终读不到文本时回调（参数为应用名），用于提示改用快捷键兜底
+    var onTextUnreadable: ((String) -> Void)?
+    private var unreadableStrokes = 0
+    private var hintedPids: Set<pid_t> = []
+    /// 最近一次成功读到文本的时间，用于避免"可读应用快速连打"被误判
+    private var lastReadableAt = Date.distantPast
+    /// 修饰键 keyCode，不计入"正在打字"的判定
+    private static let modifierKeyCodes: Set<Int64> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
 
     private init() {
         diffEngine.onTrigger = { text in
@@ -142,12 +151,44 @@ final class InputMonitor {
     /// 读取焦点元素当前值并驱动 diff；辅助功能刚开启后的首读只建立基线
     private func feedCurrentValue(of element: AXUIElement) {
         guard let value = currentValue(of: element) else { return }
+        unreadableStrokes = 0
+        lastReadableAt = Date()
+        let selection = selectedTextRange(of: element)
+        // 选区非空 + 当前是中文输入法 ≈ 组字（marked text）中；
+        // 英文输入法下选区非空只是普通选中文本，不算组字
+        let composing = (selection?.length ?? 0) > 0 && isChineseInputSource()
         if awaitingFirstValue {
             awaitingFirstValue = false
             diffEngine.reset(text: value)
         } else {
-            diffEngine.feed(newValue: value)
+            diffEngine.feed(newValue: value,
+                            isComposing: composing,
+                            caretLocation: selection?.location)
         }
+    }
+
+    /// 焦点元素选区（组字时选区覆盖 marked text）；location/length 均为 UTF-16 偏移
+    private func selectedTextRange(of element: AXUIElement) -> CFRange? {
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rangeValue = rangeRef else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &range) else { return nil }
+        return range
+    }
+
+    /// 当前输入源是否为中文输入法（2 秒缓存，避免频繁查询 TIS）
+    private var chineseInputSourceCache: (value: Bool, at: Date)?
+    private func isChineseInputSource() -> Bool {
+        if let cache = chineseInputSourceCache, Date().timeIntervalSince(cache.at) < 2 { return cache.value }
+        var value = false
+        if let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           let pointer = TISGetInputSourceProperty(source, kTISPropertyInputSourceLanguages) {
+            let languages = unsafeBitCast(pointer, to: CFArray.self) as? [String]
+            value = languages?.contains("zh") ?? false
+        }
+        chineseInputSourceCache = (value, Date())
+        return value
     }
 
     // MARK: - 下钻查找文本域
@@ -266,6 +307,7 @@ final class InputMonitor {
     fileprivate func handleKeyDown(keyCode: Int64) {
         guard !isPaused else { return }
         ensureFocusedWatch()
+        if !Self.modifierKeyCodes.contains(keyCode) { noteUnreadable() }
         switch keyCode {
         case 36: // return
             diffEngine.forceFlush()
@@ -274,6 +316,22 @@ final class InputMonitor {
         default:
             break
         }
+    }
+
+    /// 连续多次按键仍读不到文本 → 判定该应用 AX 不可读，提示改用快捷键兜底（每个应用只提示一次）
+    private func noteUnreadable() {
+        // 1 秒内读过文本说明 AX 正常，快速连打不应计入
+        guard Date().timeIntervalSince(lastReadableAt) > 1 else {
+            unreadableStrokes = 0
+            return
+        }
+        unreadableStrokes += 1
+        guard unreadableStrokes >= 8, let app = NSWorkspace.shared.frontmostApplication else { return }
+        let pid = app.processIdentifier
+        guard !hintedPids.contains(pid) else { return }
+        hintedPids.insert(pid)
+        unreadableStrokes = 0
+        onTextUnreadable?(app.localizedName ?? "当前应用")
     }
 }
 
